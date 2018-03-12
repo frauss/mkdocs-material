@@ -22,6 +22,10 @@
 
 import escape from "escape-string-regexp"
 import lunr from "expose-loader?lunr!lunr"
+import pako from "pako"
+
+const debug = require("debug")("application:SearchResult")
+const searchDebug = require("debug")("application:SearchDebug")
 
 /* ----------------------------------------------------------------------------
  * Functions
@@ -41,7 +45,7 @@ import lunr from "expose-loader?lunr!lunr"
 const truncate = (string, n) => {
   let i = n
   if (string.length > i) {
-    while (string[i] !== " " && --i > 0);
+    while (string[i] !== " " && --i > 0) ;
     return `${string.substring(0, i)}...`
   }
   return string
@@ -61,6 +65,53 @@ const translate = key => {
   return meta.content
 }
 
+const strMapToObj = strMap => {
+  const obj = Object.create(null)
+  for (const [k, v] of strMap) {
+    // We don’t escape the key '__proto__'
+    // which can cause problems on older engines
+    obj[k] = v
+  }
+  return obj
+}
+
+const objToStrMap = obj => {
+  const strMap = new Map()
+  for (const k of Object.keys(obj)) {
+    strMap.set(k, obj[k])
+  }
+  return strMap
+}
+
+const strMapToJson = strMap => {
+  return JSON.stringify(strMapToObj(strMap))
+}
+
+const jsonToStrMap = jsonStr => {
+  return objToStrMap(JSON.parse(jsonStr))
+}
+
+const isSearchableLength = textToSearch => {
+  let returnValue = false
+  if (textToSearch.length < 3) {
+    returnValue = false
+  }
+  else {
+    const tokens = textToSearch.split(" ")
+    if (tokens.length === 1) {
+      returnValue = true
+    }
+    else {
+      // returnValue = tokens.every(token => {
+      //   return token.length >= 3
+      // })
+      return (tokens[tokens.length - 1].length > 2)
+    }
+  }
+  debug(`isSearchableLength() returning ${returnValue} with text = "${textToSearch}"`)
+  return returnValue
+}
+
 /* ----------------------------------------------------------------------------
  * Class
  * ------------------------------------------------------------------------- */
@@ -73,6 +124,7 @@ export default class Result {
    * @constructor
    *
    * @property {HTMLElement} el_ - Search result container
+   * @property {HTMLElement} inputEl_ - Search query input
    * @property {(Array<Object>|Function)} data_ - Raw document data
    * @property {Object} docs_ - Indexed documents
    * @property {HTMLElement} meta_ - Search meta information
@@ -84,15 +136,24 @@ export default class Result {
    * @property {string} value_ - Last input value
    *
    * @param {(string|HTMLElement)} el - Selector or HTML element
+   * @param {(string|HTMLElement)} inputEl - Selector or HTML element
    * @param {(Array<Object>|Function)} data - Function providing data or array
    */
-  constructor(el, data) {
-    const ref = (typeof el === "string")
+  constructor(el, inputEl, data) {
+    let ref = (typeof el === "string")
       ? document.querySelector(el)
       : el
     if (!(ref instanceof HTMLElement))
       throw new ReferenceError
     this.el_ = ref
+
+    ref = (typeof inputEl === "string")
+      ? document.querySelector(inputEl)
+      : inputEl
+    if (!(ref instanceof HTMLElement))
+      throw new ReferenceError
+    this.inputEl_ = ref
+    this.inputEl_.style.visibility = "hidden"
 
     /* Retrieve metadata and list element */
     const [meta, list] = Array.prototype.slice.call(this.el_.children)
@@ -119,6 +180,154 @@ export default class Result {
     this.lang_ = translate("search.language").split(",")
       .filter(Boolean)
       .map(lang => lang.trim())
+
+    /* Initialize index */
+    if (this.checkForSavedIndexData()) {
+      this.restoreIndexData()
+      this.inputEl_.style.visibility = "visible"
+    }
+    else {
+      const init = docs => {
+        debug(`Creating lunr index containing ${docs.length} docs`)
+        this.createSearchIndex(docs)
+
+        /* Register event handler for lazy rendering */
+        const container = this.el_.parentNode
+        if (!(container instanceof HTMLElement))
+          throw new ReferenceError
+        container.addEventListener("scroll", () => {
+          while (this.stack_.length && container.scrollTop +
+          container.offsetHeight >= container.scrollHeight - 16)
+            this.stack_.splice(0, 10).forEach(render => render())
+        })
+        this.inputEl_.style.visibility = "visible"
+      }
+      /* eslint-enable no-invalid-this */
+
+      /* Initialize index after short timeout to account for transition */
+      debug("Delaying initialization of lunr index")
+      setTimeout(() => {
+        debug("Starting initialization of lunr index")
+        return typeof this.data_ === "function"
+          ? this.data_().then(init)
+          : init(this.data_)
+      }, 250)
+    }
+  }
+
+  /**
+   * Create the lunr search index from the set of documents on the site
+   *
+   * @param {(Object)} data - Document data
+   */
+  createSearchIndex(data) {
+
+    /* Preprocess and index sections and documents */
+    this.docs_ = data.reduce((docs, doc) => {
+      const [path, hash] = doc.location.split("#")
+
+      /* Associate section with parent document */
+      if (hash) {
+        doc.parent = docs.get(path)
+
+        /* Override page title with document title if first section */
+        if (doc.parent && !doc.parent.done) {
+          doc.parent.title = doc.title
+          doc.parent.text = doc.text
+          doc.parent.done = true
+        }
+      }
+
+      /* Some cleanup on the text */
+      doc.text = doc.text
+        .replace(/\n/g, " ")               /* Remove newlines */
+        .replace(/\s+/g, " ")              /* Compact whitespace */
+        .replace(/\s+([,.:;!?])/g, /* Correct punctuation */
+          (_, char) => char)
+
+      /* Index sections and documents, but skip top-level headline */
+      if (!doc.parent || doc.parent.title !== doc.title)
+        docs.set(doc.location, doc)
+      return docs
+    }, new Map)
+
+    /* eslint-disable no-invalid-this */
+    const docs = this.docs_
+    const lang = this.lang_
+
+    /* Create stack and index */
+    this.stack_ = []
+    this.index_ = lunr(function() {
+      const filters = {
+        "search.pipeline.trimmer": lunr.trimmer,
+        "search.pipeline.stopwords": lunr.stopWordFilter
+      }
+
+      /* Disable stop words filter and trimmer, if desired */
+      const pipeline = Object.keys(filters).reduce((result, name) => {
+        if (!translate(name).match(/^false$/i))
+          result.push(filters[name])
+        return result
+      }, [])
+
+      /* Remove stemmer, as it cripples search experience */
+      this.pipeline.reset()
+      if (pipeline)
+        this.pipeline.add(...pipeline)
+
+      /* Set up alternate search languages */
+      if (lang.length === 1 && lang[0] !== "en" && lunr[lang[0]]) {
+        this.use(lunr[lang[0]])
+      } else if (lang.length > 1) {
+        this.use(lunr.multiLanguage(...lang))
+      }
+
+      /* Index fields */
+      this.field("title", { boost: 10 })
+      this.field("text")
+      this.ref("location")
+
+      /* Index documents */
+      docs.forEach(doc => this.add(doc))
+    })
+
+    this.persistIndexData()
+  }
+
+  static checkForSavedIndexData() {
+    return (window.sessionStorage.getItem("searchIndex") !== null)
+  }
+
+  persistIndexData() {
+
+    // Save the generated index and docs for subsequent use
+    const uncompressedDocs = strMapToJson(this.docs_)
+    debug(`Compressing docs data JSON with length = ${uncompressedDocs.length}`)
+    const compressedDocs = pako.deflate(uncompressedDocs, { to: "string" })
+    debug(`Compressed docs data JSON to length = ${compressedDocs.length}`)
+    window.sessionStorage.setItem("searchDocs", compressedDocs)
+
+    const uncompressedIndex = JSON.stringify(this.index_)
+    debug(`Compressing index JSON with length = ${uncompressedIndex.length}`)
+    const compressedIndex = pako.deflate(uncompressedIndex, { to: "string" })
+    debug(`Compressed index JSON to length = ${compressedIndex.length}`)
+    window.sessionStorage.setItem("searchIndex", compressedIndex)
+  }
+
+  restoreIndexData() {
+    const savedIndexData = window.sessionStorage.getItem("searchIndex")
+    debug(`Using compressed cached version of search index with size = ${savedIndexData.length}`)
+    const uncompressedIndex = pako.inflate(savedIndexData, { to: "string" })
+    debug(`Uncompressed index back to size = ${uncompressedIndex.length}`)
+    this.index_ = lunr.Index.load(JSON.parse(uncompressedIndex))
+    debug("Parsed and loaded serialized index")
+
+    const savedDocs = window.sessionStorage.getItem("searchDocs")
+    debug(`Using compressed cached version of docs data with size = ${savedDocs.length}`)
+    const uncompressedDocs = pako.inflate(savedDocs, { to: "string" })
+    debug(`Uncompressed index back to size = ${uncompressedDocs.length}`)
+    this.docs_ = jsonToStrMap(uncompressedDocs)
+    debug("Parsed and loaded docs data index")
   }
 
   /**
@@ -128,109 +337,16 @@ export default class Result {
    */
   update(ev) {
 
-    /* Initialize index, if this has not be done yet */
-    if (ev.type === "focus" && !this.index_) {
-
-      /* Initialize index */
-      const init = data => {
-
-        /* Preprocess and index sections and documents */
-        this.docs_ = data.reduce((docs, doc) => {
-          const [path, hash] = doc.location.split("#")
-
-          /* Associate section with parent document */
-          if (hash) {
-            doc.parent = docs.get(path)
-
-            /* Override page title with document title if first section */
-            if (doc.parent && !doc.parent.done) {
-              doc.parent.title = doc.title
-              doc.parent.text  = doc.text
-              doc.parent.done  = true
-            }
-          }
-
-          /* Some cleanup on the text */
-          doc.text = doc.text
-            .replace(/\n/g, " ")               /* Remove newlines */
-            .replace(/\s+/g, " ")              /* Compact whitespace */
-            .replace(/\s+([,.:;!?])/g,         /* Correct punctuation */
-              (_, char) => char)
-
-          /* Index sections and documents, but skip top-level headline */
-          if (!doc.parent || doc.parent.title !== doc.title)
-            docs.set(doc.location, doc)
-          return docs
-        }, new Map)
-
-        /* eslint-disable no-invalid-this */
-        const docs = this.docs_,
-              lang = this.lang_
-
-        /* Create stack and index */
-        this.stack_ = []
-        this.index_ = lunr(function() {
-          const filters = {
-            "search.pipeline.trimmer": lunr.trimmer,
-            "search.pipeline.stopwords": lunr.stopWordFilter
-          }
-
-          /* Disable stop words filter and trimmer, if desired */
-          const pipeline = Object.keys(filters).reduce((result, name) => {
-            if (!translate(name).match(/^false$/i))
-              result.push(filters[name])
-            return result
-          }, [])
-
-          /* Remove stemmer, as it cripples search experience */
-          this.pipeline.reset()
-          if (pipeline)
-            this.pipeline.add(...pipeline)
-
-          /* Set up alternate search languages */
-          if (lang.length === 1 && lang[0] !== "en" && lunr[lang[0]]) {
-            this.use(lunr[lang[0]])
-          } else if (lang.length > 1) {
-            this.use(lunr.multiLanguage(...lang))
-          }
-
-          /* Index fields */
-          this.field("title", { boost: 10 })
-          this.field("text")
-          this.ref("location")
-
-          /* Index documents */
-          docs.forEach(doc => this.add(doc))
-        })
-
-        /* Register event handler for lazy rendering */
-        const container = this.el_.parentNode
-        if (!(container instanceof HTMLElement))
-          throw new ReferenceError
-        container.addEventListener("scroll", () => {
-          while (this.stack_.length && container.scrollTop +
-              container.offsetHeight >= container.scrollHeight - 16)
-            this.stack_.splice(0, 10).forEach(render => render())
-        })
-      }
-      /* eslint-enable no-invalid-this */
-
-      /* Initialize index after short timeout to account for transition */
-      setTimeout(() => {
-        return typeof this.data_ === "function"
-          ? this.data_().then(init)
-          : init(this.data_)
-      }, 250)
-
     /* Execute search on new input event */
-    } else if (ev.type === "focus" || ev.type === "keyup") {
+    if (ev.type === "focus" || ev.type === "keyup") {
       const target = ev.target
       if (!(target instanceof HTMLInputElement))
         throw new ReferenceError
 
       /* Abort early, if index is not build or input hasn't changed */
-      if (!this.index_ || target.value === this.value_)
+      if (!this.index_ || target.value === this.value_) {
         return
+      }
 
       /* Clear current list */
       while (this.list_.firstChild)
@@ -238,35 +354,36 @@ export default class Result {
 
       /* Abort early, if search input is empty */
       this.value_ = target.value
-      if (this.value_.length === 0) {
+      if (this.value_.length === 0 || !isSearchableLength(target.value)) {
         this.meta_.textContent = this.message_.placeholder
         return
       }
 
       /* Perform search on index and group sections by document */
-      const result = this.index_
+      const queryResults = this.index_
 
-        /* Append trailing wildcard to all terms for prefix querying */
+      /* Append trailing wildcard to all terms for prefix querying */
         .query(query => {
           this.value_.toLowerCase().split(" ")
             .filter(Boolean)
             .forEach(term => {
               query.term(term, { wildcard: lunr.Query.wildcard.TRAILING })
             })
+          debug(`Performing query = <${JSON.stringify(query)}>`)
         })
 
-        /* Process query results */
-        .reduce((items, item) => {
-          const doc = this.docs_.get(item.ref)
-          if (doc.parent) {
-            const ref = doc.parent.location
-            items.set(ref, (items.get(ref) || []).concat(item))
-          } else {
-            const ref = doc.location
-            items.set(ref, (items.get(ref) || []))
-          }
-          return items
-        }, new Map)
+      /* Process query results */
+      debug(`Query returned ${queryResults.length} items`)
+      const result = queryResults.reduce((items, item) => {
+        searchDebug(`Search returned item with reference = ${item.ref}`)
+        const doc = this.docs_.get(item.ref)
+        searchDebug(`Doc reference has location = ${doc.location} and parent reference = ${(doc.parent) ? doc.parent.location : "None"}`)
+        const ref = (doc.parent) ? doc.parent.location : doc.location
+        const value = (doc.parent) ? (items.get(ref) || []).concat(item) : (items.get(ref) || [])
+        items.set(ref, value)
+        searchDebug(`yielded items: Key = ${ref}, value = ${JSON.stringify(value)}`)
+        return items
+      }, new Map)
 
       /* Assemble regular expressions for matching */
       const query = escape(this.value_.trim()).replace(
@@ -284,8 +401,7 @@ export default class Result {
         /* Render article */
         const article = (
           <li class="md-search-result__item">
-            <a href={doc.location} title={doc.title}
-              class="md-search-result__link" tabindex="-1">
+            <a href={doc.location} title={doc.title} class="md-search-result__link" tabindex="-1">
               <article class="md-search-result__article
                     md-search-result__article--document">
                 <h1 class="md-search-result__title">
@@ -305,17 +421,16 @@ export default class Result {
           return () => {
             const section = this.docs_.get(item.ref)
             article.appendChild(
-              <a href={section.location} title={section.title}
-                class="md-search-result__link" data-md-rel="anchor"
-                tabindex="-1">
+              <a href={section.location} title={section.title} class="md-search-result__link" data-md-rel="anchor" tabindex="-1">
                 <article class="md-search-result__article">
                   <h1 class="md-search-result__title">
                     {{ __html: section.title.replace(match, highlight) }}
                   </h1>
                   {section.text.length ?
                     <p class="md-search-result__teaser">
-                      {{ __html: truncate(
-                        section.text.replace(match, highlight), 400)
+                      {{
+                        __html: truncate(
+                          section.text.replace(match, highlight), 400)
                       }}
                     </p> : {}}
                 </article>
@@ -333,7 +448,7 @@ export default class Result {
       if (!(container instanceof HTMLElement))
         throw new ReferenceError
       while (this.stack_.length &&
-          container.offsetHeight >= container.scrollHeight - 16)
+      container.offsetHeight >= container.scrollHeight - 16)
         (this.stack_.shift())()
 
       /* Bind click handlers for anchors */

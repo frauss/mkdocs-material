@@ -35,6 +35,7 @@ import "custom-event-polyfill"
 import "unfetch/polyfill"
 
 import Promise from "promise-polyfill"
+
 window.Promise = window.Promise || Promise
 
 /* ----------------------------------------------------------------------------
@@ -45,6 +46,8 @@ import Clipboard from "clipboard"
 import FastClick from "fastclick"
 
 import Material from "./components/Material"
+
+const debug  = require("debug")("application:main")
 
 /* ----------------------------------------------------------------------------
  * Functions
@@ -74,6 +77,8 @@ const translate = key => {
  * @param {Object} config - Configuration
  */
 function initialize(config) { // eslint-disable-line func-style
+
+  debug("Initializing application")
 
   /* Initialize Modernizr and FastClick */
   new Material.Event.Listener(document, "DOMContentLoaded", () => {
@@ -112,8 +117,7 @@ function initialize(config) { // eslint-disable-line func-style
 
         /* Create button with message container */
         const button = (
-          <button class="md-clipboard" title={translate("clipboard.copy")}
-            data-clipboard-target={`#${id} pre, #${id} code`}>
+          <button class="md-clipboard" title={translate("clipboard.copy")} data-clipboard-target={`#${id} pre, #${id} code`}>
             <span class="md-clipboard__message"></span>
           </button>
         )
@@ -213,16 +217,16 @@ function initialize(config) { // eslint-disable-line func-style
 
   /* Component: header shadow toggle */
   new Material.Event.Listener(window, [
-    "scroll", "resize", "orientationchange"
-  ], new Material.Header.Shadow(
+      "scroll", "resize", "orientationchange"
+    ], new Material.Header.Shadow(
     "[data-md-component=container]",
     "[data-md-component=header]")
   ).listen()
 
   /* Component: header title toggle */
   new Material.Event.Listener(window, [
-    "scroll", "resize", "orientationchange"
-  ], new Material.Header.Title(
+      "scroll", "resize", "orientationchange"
+    ], new Material.Header.Title(
     "[data-md-component=title]",
     ".md-typeset h1")
   ).listen()
@@ -284,22 +288,31 @@ function initialize(config) { // eslint-disable-line func-style
       new Material.Event.Listener("[data-md-toggle=search]", "change",
         new Material.Search.Lock("[data-md-toggle=search]")))
 
-    /* Component: search results */
-    new Material.Event.Listener("[data-md-component=query]", [
-      "focus", "keyup", "change"
-    ], new Material.Search.Result("[data-md-component=result]", () => {
-      return fetch(`${config.url.base}/${
-        config.version < "0.17" ? "mkdocs" : "search"
-      }/search_index.json`, {
-        credentials: "same-origin"
-      }).then(response => response.json())
+    debug("Creating new search result object")
+    const indexFetchFunction = () => {
+      const searchIndexUrl = `${config.url.base}/${config.version < "0.17" ? "mkdocs" : "search"}/search_index.json`
+      debug(`Fetching search index from ${searchIndexUrl}`)
+      return fetch(searchIndexUrl,
+        {
+          credentials: "same-origin"
+        })
+        .then(response => response.json())
         .then(data => {
           return data.docs.map(doc => {
-            doc.location = config.url.base + doc.location
+
+            // Try to use absolute path here
+            doc.location = config.url.site + doc.location
             return doc
           })
         })
-    })).listen()
+    }
+    const searchResult = new Material.Search.Result("[data-md-component=result]",
+      "[data-md-component=search]", indexFetchFunction)
+
+    /* Component: search results */
+    new Material.Event.Listener("[data-md-component=query]", [
+      "focus", "keyup", "change"
+    ], searchResult).listen();
 
     /* Listener: focus input after form reset */
     new Material.Event.Listener("[data-md-component=reset]", "click", () => {
@@ -371,18 +384,18 @@ function initialize(config) { // eslint-disable-line func-style
             }
           }
 
-        /* Escape or Tab: close search */
+          /* Escape or Tab: close search */
         } else if (ev.keyCode === 9 || ev.keyCode === 27) {
           toggle.checked = false
           toggle.dispatchEvent(new CustomEvent("change"))
           query.blur()
 
-        /* Horizontal arrows and backspace: focus input */
+          /* Horizontal arrows and backspace: focus input */
         } else if ([8, 37, 39].indexOf(ev.keyCode) !== -1) {
           if (query !== document.activeElement)
             query.focus()
 
-        /* Vertical arrows: select previous or next search result */
+          /* Vertical arrows: select previous or next search result */
         } else if ([38, 40].indexOf(ev.keyCode) !== -1) {
           const key = ev.keyCode
 
@@ -419,7 +432,7 @@ function initialize(config) { // eslint-disable-line func-style
           return false
         }
 
-      /* Search is closed and we're not inside a form */
+        /* Search is closed and we're not inside a form */
       } else if (document.activeElement && !document.activeElement.form) {
 
         /* F/S: Open search if not in input field */
@@ -492,11 +505,13 @@ function initialize(config) { // eslint-disable-line func-style
     else if (!(el instanceof HTMLAnchorElement))
       throw new ReferenceError
     switch (el.dataset.mdSource) {
-      case "github": return new Material.Source.Adapter.GitHub(el).fetch()
-      default: return Promise.resolve([])
+      case "github":
+        return new Material.Source.Adapter.GitHub(el).fetch()
+      default:
+        return Promise.resolve([])
     }
 
-  /* Render repository information */
+    /* Render repository information */
   })().then(facts => {
     const sources = document.querySelectorAll("[data-md-source]")
     Array.prototype.forEach.call(sources, source => {

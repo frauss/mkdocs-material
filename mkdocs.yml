@@ -121,3 +121,4 @@ pages:
 google_analytics:
   - !!python/object/apply:os.getenv ["GOOGLE_ANALYTICS_KEY"]
   - auto
+dev_addr: 127.0.0.1:8100
